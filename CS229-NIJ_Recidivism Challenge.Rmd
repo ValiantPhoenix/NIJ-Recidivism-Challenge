@@ -1,0 +1,472 @@
+---
+title: "NIJ Recidivism Challenge"
+author: "Bruce Spencer III"
+date: "2022/4/25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#Need the tictoc library to figure out how long each code chunk takes
+library(tictoc)
+#Clear All Variables
+rm(list = ls())
+#Read full data set in
+NIJ.Data=read.csv("C:/Users/Bruce/Documents/CS 229 - Machine Learning/CS229 Project/NIJ_s_Recidivism_Challenge_Full_Dataset.csv")
+
+#Now we should omit some of the columns like ID which we know don't have an effect on recidivism rates
+#Eliminate ID names
+NIJ.Data= subset(NIJ.Data, select = -c(ID) )
+#Eliminate which year the recidivisms took place
+NIJ.Data= subset(NIJ.Data, select = -c(Recidivism_Arrest_Year1) )
+NIJ.Data= subset(NIJ.Data, select = -c(Recidivism_Arrest_Year2) )
+NIJ.Data= subset(NIJ.Data, select = -c(Recidivism_Arrest_Year3) )
+
+#Separate out into training and test set
+Train.NIJ.Data=NIJ.Data[which(NIJ.Data$Training_Sample == 1),]
+Test.NIJ.Data=NIJ.Data[which(NIJ.Data$Training_Sample == 0),]
+
+#Then we don't need to know if it's a training set anymore so remove that column or else it will make the matrix singular
+Train.NIJ.Data= subset(Train.NIJ.Data, select = -c(Training_Sample) )
+Test.NIJ.Data= subset(Test.NIJ.Data, select = -c(Training_Sample) )
+
+#It would be good to know how many incomplete data points (that is for which subjects there are fields missing) there are in the test and training set
+incom.train=sum(!complete.cases(Train.NIJ.Data))
+cat("The number of incomplete training data points are:",incom.train)
+incom.test=sum(!complete.cases(Test.NIJ.Data))
+cat("The number of incomplete test data points are:",incom.test)
+
+
+
+#Make an omitted training data set
+Train.NIJ.Data.Omit=na.omit(Train.NIJ.Data)
+
+#Fill in missing data with MICE
+#https://data.library.virginia.edu/getting-started-with-multiple-imputation-in-r/
+tic("mice")
+library(mice)
+miceMod.Train <- mice(Train.NIJ.Data)
+miceOutput.Train <- complete(miceMod.Train)
+miceMod.Test = mice(Test.NIJ.Data)
+miceOutput.Test=complete(miceMod.Test)
+toc()
+#Now we verify that MICE worked
+incom.train=sum(!complete.cases(miceOutput.Train))
+cat("The number of incomplete training data points are:",incom.train)
+incom.test=sum(!complete.cases(miceOutput.Test))
+cat("The number of incomplete test data points are:",incom.test)
+
+```
+
+First we do logistic regression
+```{r}
+#Bring in the ISLR library
+library(ISLR)
+tic("logistic regression")
+#Run a logistic regression model using the MICE data
+glm.fits=glm(Recidivism_Within_3years~.,data=miceOutput.Train,family=binomial)
+
+#Make a prediction table
+glm.probs=predict(glm.fits,miceOutput.Test,type ="response")
+c=length(glm.probs)
+glm.pred=rep("false",c)
+glm.pred[glm.probs>0.5]="true"
+table(glm.pred,miceOutput.Test$Recidivism_Within_3years)
+glm.accuracy=sum(glm.pred==miceOutput.Test$Recidivism_Within_3years)/c
+glm.accuracy
+
+Fun=as.integer(as.factor(miceOutput.Test$Recidivism_Within_3years))
+Fun[Fun==1]=0
+Fun[Fun==2]=1
+glm.bs=(1/c)*sum((Fun-as.integer(glm.probs))^2)
+toc()
+
+```
+
+In order to make sure our matrix is not collinear and doesn't suffer from rank deficiency, we must turn all factors into integers
+```{r}
+#First let's see what part of our data are factors
+str(Train.NIJ.Data)
+#That's a lot, so now let's turn all the parts that are factors into integers
+Train.X=miceOutput.Train
+indx=sapply(Train.X,is.factor)
+Train.X[indx]=lapply(Train.X[indx],function(x) as.integer(as.factor(x)))
+#Now let's make sure it worked
+str(Train.X)
+#Now we need to remove the columns that had NA values for cor and remove this from the test set too
+Train.X= subset(Train.X, select = -c(Supervision_Risk_Score_First) )
+#Then I need to make the same changes to my test data set so it doesn't mess up
+Test.X=miceOutput.Test
+indx=sapply(Test.X,is.factor)
+Test.X[indx]=lapply(Test.X[indx],function(x) as.integer(as.factor(x)))
+Test.X=subset(Test.X, select = -c(Supervision_Risk_Score_First) )
+
+TooMuchFun=as.integer(as.factor(miceOutput.Test$Recidivism_Within_3years))
+TooMuchFun[TooMuchFun==1]=0
+TooMuchFun[TooMuchFun==2]=1
+```
+
+
+Now let's shoot for linear discriminant analysis
+```{r}
+#Now do an LDA
+tic("LDA")
+library(MASS)
+lda.fit=lda(Recidivism_Within_3years~.,data=Train.X)
+lda.pred=predict(lda.fit,Test.X,type ="response")
+lda.class=lda.pred$class
+table(lda.class,Test.X$Recidivism_Within_3years)
+lda.accuracy=sum(lda.class==Test.X$Recidivism_Within_3years)/c
+
+lda.prob=lda.pred$posterior[,1]
+lda.bs=(1/c)*sum((lda.prob-TooMuchFun)^2)
+toc()
+```
+
+Now let's try a QDA
+```{r}
+tic("QDA")
+#Do a QDA
+qda.fit=qda(Recidivism_Within_3years~.,data=Train.X)
+qda.pred=predict(qda.fit,Test.X,type ="response")
+qda.class=qda.pred$class
+table(qda.class,Test.X$Recidivism_Within_3years)
+qda.accuracy=sum(qda.class==Test.X$Recidivism_Within_3years)/c
+qda.accuracy
+
+qda.prob=qda.pred$posterior[,1]
+qda.bs=(1/c)*sum((qda.prob-TooMuchFun)^2)
+toc()
+```
+
+Now let's try for SVM
+```{r}
+library(e1071)
+svm.Train.X=Train.X
+svm.Train.X$Recidivism_Within_3years=as.factor(svm.Train.X$Recidivism_Within_3years)
+
+tic("SVM-Linear")
+#Now let's try linear
+svmfit.linear=svm(Recidivism_Within_3years~.,data=svm.Train.X,kernel="linear",probability=TRUE)
+svmfitpredict.linear=predict(svmfit.linear,Test.X,probability=TRUE)
+svmfitprobs.linear=attr(svmfitpredict.linear, "probabilities")[,1]
+c=length(svmfitprobs.linear)
+svmfitpred.linear=rep(0,c)
+svmfitpred.linear[svmfitprobs.linear<0.5]=1
+svmfitpred.linear[svmfitprobs.linear>0.5]=2
+table(svmfitpred.linear,Test.X$Recidivism_Within_3years)
+svm.linear.accuracy=sum(svmfitpred.linear==Test.X$Recidivism_Within_3years)/c
+svm.linear.accuracy
+
+svm.linear.bs=(1/c)*sum((svmfitprobs.linear-TooMuchFun)^2)
+toc()
+
+tic("SVM-Radial")
+#Now for radial fits
+svmfit.radial=svm(Recidivism_Within_3years~.,data=svm.Train.X,kernel="radial",probability=TRUE)
+svmfitpredict.radial=predict(svmfit.radial,Test.X,probability=TRUE)
+svmfitprobs.radial=attr(svmfitpredict.radial, "probabilities")[,1]
+c=length(svmfitprobs.radial)
+svmfitpred.radial=rep(0,c)
+svmfitpred.radial[svmfitprobs.radial<0.5]=1
+svmfitpred.radial[svmfitprobs.radial>0.5]=2
+table(svmfitpred.radial,Test.X$Recidivism_Within_3years)
+svm.radial.accuracy=sum(svmfitpred.radial==Test.X$Recidivism_Within_3years)/c
+svm.radial.accuracy
+
+svm.radial.bs=(1/c)*sum((svmfitprobs.radial-TooMuchFun)^2)
+toc()
+
+
+tic("SVM-Polynomial")
+#Now for polynomial fit
+svmfit.poly=svm(Recidivism_Within_3years~.,data=svm.Train.X,kernel="polynomial",probability=TRUE)
+svmfitpredict.poly=predict(svmfit.poly,Test.X,probability=TRUE)
+svmfitprobs.poly=attr(svmfitpredict.poly, "probabilities")[,1]
+c=length(svmfitprobs.poly)
+svmfitpred.poly=rep(0,c)
+svmfitpred.poly[svmfitprobs.poly<0.5]=1
+svmfitpred.poly[svmfitprobs.poly>0.5]=2
+table(svmfitpred.poly,Test.X$Recidivism_Within_3years)
+svm.poly.accuracy=sum(svmfitpred.poly==Test.X$Recidivism_Within_3years)/c
+svm.poly.accuracy
+
+svm.poly.bs=(1/c)*sum((svmfitprobs.poly-TooMuchFun)^2)
+toc()
+
+tic("SVM-sigmoid")
+#Now for sigmoid fit
+svmfit.sig=svm(Recidivism_Within_3years~.,data=svm.Train.X,kernel="sig",probability=TRUE)
+svmfitpredict.sig=predict(svmfit.sig,Test.X,probability=TRUE)
+svmfitprobs.sig=attr(svmfitpredict.sig, "probabilities")[,1]
+c=length(svmfitprobs.sig)
+svmfitpred.sig=rep(0,c)
+svmfitpred.sig[svmfitprobs.sig<0.5]=1
+svmfitpred.sig[svmfitprobs.sig>0.5]=2
+table(svmfitpred.sig,Test.X$Recidivism_Within_3years)
+svm.sig.accuracy=sum(svmfitpred.sig==Test.X$Recidivism_Within_3years)/c
+svm.sig.accuracy
+
+svm.sig.bs=(1/c)*sum((svmfitprobs.sig-TooMuchFun)^2)
+toc()
+```
+
+Now let's try k-nearest neighbors
+```{r}
+tic("knn")
+library(class)
+knn.factor=35
+acc.k=rep(0,knn.factor)
+knn.class=matrix(0,c,knn.factor)
+for (i in 1:knn.factor){
+  knn.pred=knn(Train.X,Test.X,Train.X$Recidivism_Within_3years,k=i)
+  knn.class[,i]=knn.pred
+acc.k[i]=sum(knn.pred==Test.X$Recidivism_Within_3years)/c
+}
+acc.rank.knn=rank(acc.k)
+inds.knn=which(acc.rank.knn %in% c(knn.factor))
+knn.accuracy=acc.k[inds.knn]
+knn.accuracy
+knn.bs=(1/c)*sum((knn.class[,inds.knn]-Test.X$Recidivism_Within_3years)^2)
+toc()
+```
+
+Now let's try a decision tree
+```{r}
+tic("Decision Tree")
+library(tree)
+tree.length=6
+grid=10^seq(1,-4,length=tree.length)
+acc.tree.values=rep(0,length(grid))
+tree.class=matrix(0,c,length(grid))
+tree.pred=matrix(0,c,length(grid))
+for (i in 1:length(grid)){
+tree=tree(Recidivism_Within_3years~.,data=Train.X,control=tree.control(19363,mindev=grid[i],minsize=2))
+yhat.tree=predict (tree ,newdata=Test.X)
+tree.pred[,i]=yhat.tree
+yhat.tree[yhat.tree<1.5]=1
+yhat.tree[yhat.tree>1.5]=2
+tree.class[,i]=yhat.tree
+acc.tree.values[i]=sum(yhat.tree==Test.X$Recidivism_Within_3years)/c
+}
+acc.rank.tree=rank(acc.tree.values) 
+inds.tree=which(acc.rank.tree %in% c(tree.length))
+acc.tree=acc.tree.values[inds.tree]
+acc.tree
+
+tree.bs=(1/c)*sum((tree.pred[,inds.tree]-Test.X$Recidivism_Within_3years)^2)
+toc()
+```
+
+Now we can try bagging
+```{r}
+tic("Bagging")
+#Now we run bagging
+library(randomForest)
+column.number=ncol(Train.X)
+x.number=column.number-1
+set.seed(1)
+tree.length=5
+ntrees=as.integer(seq(1,250,length=tree.length))
+acc.bag.values=rep(0,length(ntrees))
+bag.class=matrix(0,c,tree.length)
+bag.pred=matrix(0,c,tree.length)
+for (i in 1:tree.length){
+bag =randomForest(Recidivism_Within_3years~.,data=Train.X ,mtry=x.number, importance =TRUE,ntree=ntrees[i])
+yhat.bag=predict(bag,newdata=Test.X)
+bag.pred[,i]=yhat.bag
+yhat.bag[yhat.bag<1.5]=1
+yhat.bag[yhat.bag>1.5]=2
+bag.class[,i]=yhat.bag
+acc.bag.values[i]=sum(yhat.bag==Test.X$Recidivism_Within_3years)/c
+}
+acc.rank.bag=rank(acc.bag.values) 
+inds.bag=which(acc.rank.bag %in% c(tree.length))
+acc.bag=acc.bag.values[inds.bag]
+acc.bag
+
+bag.bs=(1/c)*sum((bag.pred[,inds.bag]-Test.X$Recidivism_Within_3years)^2)
+toc()
+```
+
+Now we can try random forests
+```{r}
+tic("Random Forests")
+ntrees=as.integer(seq(1,250,length=tree.length))
+acc.rf.values=rep(0,length(ntrees))
+rf.class=matrix(0,c,tree.length)
+rf.probs=matrix(0,c,tree.length)
+for (i in 1:tree.length){
+rf =randomForest(Recidivism_Within_3years~.,data=Train.X ,mtry=sqrt(x.number), importance =TRUE,ntree=ntrees[i])
+yhat.rf=predict(rf,newdata=Test.X)
+rf.probs[,i]=yhat.rf
+yhat.rf[yhat.rf<1.5]=1
+yhat.rf[yhat.rf>1.5]=2
+rf.class[,i]=yhat.rf
+acc.rf.values[i]=sum(yhat.rf==Test.X$Recidivism_Within_3years)/c
+}
+acc.rank.rf=rank(acc.rf.values) 
+inds.rf=which(acc.rank.rf %in% c(tree.length))
+acc.rf=acc.rf.values[inds.rf]
+acc.rf
+
+rf.bs=(1/c)*sum((rf.probs[,inds.rf]-Test.X$Recidivism_Within_3years)^2)
+toc()
+```
+
+Now we can try boosting
+```{r}
+#Now we can try boosting
+tic("boosting")
+library(gbm)
+set.seed(1)
+boost.class=matrix(0,c,tree.length)
+boost.pred=matrix(0,c,tree.length)
+boost.probs=matrix(0,c,)
+ntrees=as.integer(seq(5,2000,length=tree.length))
+acc.boost.values=rep(0,length(ntrees))
+for (i in 1:length(ntrees)){
+boost=gbm(Recidivism_Within_3years~.,data=Train.X,distribution="gaussian",n.trees=ntrees[i])
+yhat.boost=predict(boost,newdata=Test.X,n.trees=ntrees[i])
+boost.pred[,i]=yhat.boost
+yhat.boost[yhat.boost<1.5]=1
+yhat.boost[yhat.boost>1.5]=2
+boost.class[,i]=yhat.boost
+acc.boost.values[i]=sum(yhat.boost==Test.X$Recidivism_Within_3years)/c
+}
+acc.rank.boost=rank(acc.boost.values)
+inds.boost=which(acc.rank.boost %in% c(length(ntrees)))
+acc.boost=acc.boost.values[inds.boost]
+acc.boost
+
+boost.bs=(1/c)*sum((boost.pred[,inds.boost]-Test.X$Recidivism_Within_3years)^2)
+toc()
+
+#Now let's plot some graphs
+#https://towardsdatascience.com/understanding-gradient-boosting-machines-9be756fe76ab
+#http://uc-r.github.io/gbm_regression
+#http://www.sthda.com/english/articles/36-classification-methods-essentials/143-evaluation-of-classification-model-accuracy-essentials/
+boost=gbm(Recidivism_Within_3years~.,data=Train.X,distribution="gaussian",n.trees=ntrees[inds.boost])
+summary(boost,cBars=5,las=2)
+
+#Now for accuracy table
+table(yhat.boost,miceOutput.Test$Recidivism_Within_3years)
+
+#Now for ROC Curve
+library(pROC)
+# Compute roc
+res.roc <- roc(miceOutput.Test$Recidivism_Within_3years, boost.pred[,inds.boost])
+plot.roc(res.roc, print.auc = TRUE)
+```
+
+Now time to try a neural network
+```{r}
+#Attempt at a neural network
+#https://www.datatechnotes.com/2017/10/neural-networks-example-in-r.html
+
+tic("neural network")
+library(neuralnet)
+library(caret)
+nnxtest=Test.X[,-column.number]
+nnytest=Test.X[,column.number]
+nnytest=as.factor(nnytest)
+nnTrain.X=Train.X
+nnTrain.X$Recidivism_Within_3years=as.factor(nnTrain.X$Recidivism_Within_3years)
+
+nn.level1=as.integer(seq(2,x.number-20,length=5))
+nn.acc=rep(0,length(nn.level1))
+nn.class=matrix(0,c,tree.length)
+nn.pred=matrix(0,c,tree.length)
+for (i in 1:length(nn.acc)){
+  nnet=neuralnet(Recidivism_Within_3years~., nnTrain.X[1:100,], hidden = c(nn.level1[i]), stepmax=100000, threshold=0.01, linear.output = FALSE)
+ypred = neuralnet::compute(nnet, nnxtest)
+yhat = ypred$net.result
+yhat.nn=rep(0,nrow(yhat))
+yhat.nn=yhat[,1]
+nn.pred[,i]=yhat.nn
+yhat.nn[yhat.nn>0.5]=2
+yhat.nn[yhat.nn<0.5]=1
+nn.class[,i]=yhat.nn
+cm = confusionMatrix(nnytest,as.factor(unname(yhat.nn)))
+nn.acc[i]=unname(cm$overall[1])
+}
+
+acc.rank.nn=rank(nn.acc)
+inds.nn=which(acc.rank.nn %in% c(length(ntrees)))
+acc.nn=nn.acc[inds.nn]
+acc.nn
+
+nn.bs=(1/c)*sum((nn.pred[,inds.boost]-TooMuchFun)^2)
+toc()
+```
+
+Now we can try Poisson Regression
+
+```{r}
+tic("Poisson")
+#Run a Poisson regression model using the MICE data
+poisson.fits=glm(Recidivism_Within_3years~.,data=Train.X,family=poisson)
+
+#Make a prediction table
+poisson.probs=predict(poisson.fits,Test.X,type ="response")
+c=length(poisson.probs)
+poisson.pred=rep(1,c)
+poisson.pred[poisson.probs>1.5]=2
+table(poisson.pred,Test.X$Recidivism_Within_3years)
+poisson.accuracy=sum(poisson.pred==Test.X$Recidivism_Within_3years)/c
+poisson.accuracy
+
+poisson.bs=(1/c)*sum((poisson.probs-Test.X$Recidivism_Within_3years)^2)
+toc()
+```
+
+Finally, let's try an ensemble method
+```{r}
+tic("Ensemble")
+ensemble.pick=rep(0,c)
+#Convert GLM Probabilities into actual pick
+glm.probs.en=rep(0,c)
+glm.probs.en[glm.probs>0.5]=2
+glm.probs.en[glm.probs<0.5]=1
+#Convert LDA to integers
+lda.class.en=as.integer(lda.class)
+#Convert QDA to integers
+qda.class.en=as.integer(qda.class)
+#Convert SVM's to integers
+svmfitpred.linear.en=as.integer(svmfitpred.linear)
+svmfitpred.radial.en=as.integer(svmfitpred.radial)
+svmfitpred.sig.en=as.integer(svmfitpred.sig)
+svmfitpred.radial.en=as.integer(svmfitpred.radial)
+
+#Note when adding Knn the accuracy drops from 0.71 to 0.68
+totalclass=cbind(glm.probs.en,lda.class.en,qda.class.en,svmfitpred.linear.en,svmfitpred.radial.en,svmfitpred.sig.en,svmfitpred.radial.en,poisson.probs,tree.class,bag.class,rf.class,boost.class)
+
+average.class=rowMeans(totalclass)
+probs.ensemble=average.class
+average.class[average.class<1.5]=1
+average.class[average.class>1.5]=2
+table(average.class,Test.X$Recidivism_Within_3years)
+en.accuracy=sum(average.class==Test.X$Recidivism_Within_3years)/c
+en.accuracy
+
+bs.ensemble=(1/c)*sum((probs.ensemble-Test.X$Recidivism_Within_3years)^2)
+toc()
+```
+
+Accuracy Results Table
+```{r}
+results=rbind(glm.accuracy,poisson.accuracy,lda.accuracy,qda.accuracy,knn.accuracy,acc.tree,acc.bag,acc.rf,acc.boost,acc.nn,svm.linear.accuracy,svm.poly.accuracy,svm.radial.accuracy,svm.sig.accuracy,en.accuracy)
+results
+```
+
+Brier Score Results Table
+```{r}
+bs.results=rbind(glm.bs,lda.bs,qda.bs,svm.linear.bs,svm.radial.bs,svm.poly.bs,svm.sig.bs,knn.bs,tree.bs,bag.bs,rf.bs,boost.bs,nn.bs,poisson.bs,bs.ensemble)
+bs.results
+```
+
+```{r}
+#In case I need to export a file
+setwd("C:/Users/Bruce/Documents/CS 229 - Machine Learning/CS229 Project")
+write.csv(miceOutput.Train,"Yeah.csv",quote=FALSE,row.names=FALSE)
+```
+
